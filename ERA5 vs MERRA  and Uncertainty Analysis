@@ -1,0 +1,475 @@
+# ============================================================
+# Multi-city pooled climate validation: ERA5 vs MERRA
+# - No per-city result tables
+# - Only pooled city-date points across all cities
+# - ERA 8-day -> 16-day harmonization
+# - Output:
+#     1) pooled summary by variable
+#     2) pooled scatter plots
+# ============================================================
+
+import os
+import re
+import glob
+import warnings
+import numpy as np
+import pandas as pd
+import rasterio
+import matplotlib.pyplot as plt
+
+from rasterio.transform import from_origin
+from rasterio.warp import reproject, Resampling
+
+warnings.filterwarnings("ignore")
+
+# =========================
+# 0) Config
+# =========================
+ROOT_DATA  = "/content/drive/MyDrive/Second_research/data"
+ROOT_MERRA = "/content/drive/MyDrive/Second_research/MERRA"
+
+# ---- adjustable ----
+N_CITIES   = 9
+CITY_LIST  = None   # e.g. ["Guangzhou", "Beijing"]; None = auto scan first N_CITIES
+TARGET_DEG = 0.1
+MAX_POINTS_PER_VAR = 30000   # scatter max points per variable
+RANDOM_SEED = 42
+
+# ---- variables for validation ----
+CLIMATE_VARS = ["T2M_C", "TD_C", "VPD_kPa", "WIND10M_MS", "SSRD_MJm2"]
+
+# ERA 8-day -> 16-day aggregation rules
+MEAN_VARS = {"T2M_C", "TD_C", "VPD_kPa", "WIND10M_MS"}
+SUM_VARS  = {"SSRD_MJm2"}
+
+AXIS_LABELS = {
+    "T2M_C": "Air temperature (°C)",
+    "TD_C": "Dew point (°C)",
+    "VPD_kPa": "VPD (kPa)",
+    "WIND10M_MS": "Wind speed (m s$^{-1}$)",
+    "SSRD_MJm2": "Shortwave radiation (MJ m$^{-2}$)"
+}
+
+rng = np.random.default_rng(RANDOM_SEED)
+
+# =========================
+# 1) Regex / helpers
+# =========================
+DATE_RE = re.compile(r".*_(\d{8})$")
+
+def parse_date_from_banddesc(desc):
+    m = DATE_RE.match(desc or "")
+    if not m:
+        return None
+    return pd.to_datetime(m.group(1), format="%Y%m%d", errors="coerce")
+
+def list_city_folders(root_dir):
+    xs = [d for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d))]
+    return sorted(xs)
+
+def pick_existing_city_list():
+    all_data  = set(list_city_folders(ROOT_DATA))
+    all_merra = set(list_city_folders(ROOT_MERRA))
+    common = sorted(list(all_data.intersection(all_merra)))
+    return common
+
+# =========================
+# 2) Raster IO
+# =========================
+def read_stack_by_prefix(tif_path, prefix):
+    """
+    Read bands like PREFIX_YYYYMMDD
+    Return:
+      arr[T,H,W], dates[T], prof
+    """
+    with rasterio.open(tif_path) as src:
+        desc = list(src.descriptions) if src.descriptions else []
+        idx, dates = [], []
+
+        for b, d in enumerate(desc, start=1):
+            if not d:
+                continue
+            if not d.startswith(prefix + "_"):
+                continue
+            dt = parse_date_from_banddesc(d)
+            if dt is None or pd.isna(dt):
+                continue
+            idx.append(b)
+            dates.append(dt.normalize())
+
+        if len(idx) == 0:
+            return None, None, None
+
+        arr = src.read(idx).astype(np.float32)
+        nodata = src.nodata
+        if nodata is not None:
+            arr[arr == nodata] = np.nan
+
+        prof = {
+            "crs": src.crs,
+            "transform": src.transform,
+            "width": src.width,
+            "height": src.height,
+            "bounds": src.bounds
+        }
+
+    return arr, dates, prof
+
+def same_grid(src_prof, tgt_prof):
+    return (
+        str(src_prof["crs"]) == str(tgt_prof["crs"]) and
+        src_prof["width"] == tgt_prof["width"] and
+        src_prof["height"] == tgt_prof["height"] and
+        tuple(np.round(np.array(src_prof["transform"]), 12)) ==
+        tuple(np.round(np.array(tgt_prof["transform"]), 12))
+    )
+
+def reproject_stack_to_target(arr_THW, src_prof, tgt_prof, resampling=Resampling.average):
+    if arr_THW is None:
+        return None
+    if same_grid(src_prof, tgt_prof):
+        return arr_THW.astype(np.float32)
+
+    out = np.full((arr_THW.shape[0], tgt_prof["height"], tgt_prof["width"]), np.nan, np.float32)
+    for t in range(arr_THW.shape[0]):
+        reproject(
+            source=arr_THW[t],
+            destination=out[t],
+            src_transform=src_prof["transform"],
+            src_crs=src_prof["crs"],
+            dst_transform=tgt_prof["transform"],
+            dst_crs=tgt_prof["crs"],
+            resampling=resampling
+        )
+    return out
+
+def make_target_profile_from_bounds(bounds, crs="EPSG:4326", deg=0.1):
+    left, bottom, right, top = bounds.left, bounds.bottom, bounds.right, bounds.top
+    width  = int(round((right - left) / deg))
+    height = int(round((top - bottom) / deg))
+    transform = from_origin(left, top, deg, deg)
+    return {
+        "crs": rasterio.crs.CRS.from_string(crs),
+        "transform": transform,
+        "width": width,
+        "height": height,
+        "bounds": bounds
+    }
+
+# =========================
+# 3) File discovery
+# =========================
+def discover_city_files(city):
+    data_dir  = os.path.join(ROOT_DATA, city)
+    merra_dir = os.path.join(ROOT_MERRA, city)
+
+    era_files = sorted(glob.glob(os.path.join(data_dir, "*_ERA5Lmain_8day_0p1deg_*.tif"))) + \
+                sorted(glob.glob(os.path.join(data_dir, "*_ERA5Lmain_8day_0p1deg_*.tiff")))
+
+    merra_files = sorted(glob.glob(os.path.join(merra_dir, "*_MERRA2FAST_16day_0p1deg_*.tif"))) + \
+                  sorted(glob.glob(os.path.join(merra_dir, "*_MERRA2FAST_16day_0p1deg_*.tiff"))) + \
+                  sorted(glob.glob(os.path.join(merra_dir, "*MERRA2FAST*.tif"))) + \
+                  sorted(glob.glob(os.path.join(merra_dir, "*MERRA2FAST*.tiff")))
+
+    era_files = sorted(list(dict.fromkeys(era_files)))
+    merra_files = sorted(list(dict.fromkeys(merra_files)))
+
+    return era_files, merra_files
+
+# =========================
+# 4) Variable readers
+# =========================
+def read_merge_var(files, var, tgt_prof=None, resampling=Resampling.average):
+    arr_all, dates_all = [], []
+    prof_ref = None
+
+    for fp in files:
+        arr, dates, prof = read_stack_by_prefix(fp, var)
+        if arr is None:
+            continue
+
+        if tgt_prof is not None:
+            arr = reproject_stack_to_target(arr, prof, tgt_prof, resampling=resampling)
+
+        arr_all.append(arr)
+        dates_all.extend(dates)
+
+        if prof_ref is None:
+            prof_ref = prof
+
+    if len(arr_all) == 0:
+        return None, None, None
+
+    arr_all = np.concatenate(arr_all, axis=0)
+    dates_all = pd.to_datetime(pd.Series(dates_all)).dt.normalize().tolist()
+
+    # sort
+    order = np.argsort(pd.to_datetime(dates_all).values)
+    arr_all = arr_all[order]
+    dates_all = [dates_all[i] for i in order]
+
+    # merge duplicate dates by mean
+    df_idx = pd.DataFrame({"date": pd.to_datetime(dates_all), "idx": np.arange(len(dates_all))})
+    grouped = df_idx.groupby("date")["idx"].apply(list)
+
+    if grouped.apply(len).max() > 1:
+        new_arr, new_dates = [], []
+        for d, idxs in grouped.items():
+            block = arr_all[idxs]
+            new_arr.append(np.nanmean(block, axis=0).astype(np.float32))
+            new_dates.append(pd.Timestamp(d).normalize())
+        arr_all = np.stack(new_arr, axis=0)
+        dates_all = new_dates
+
+    return arr_all, dates_all, (tgt_prof if tgt_prof is not None else prof_ref)
+
+def spatial_mean_ts(arr_THW):
+    return np.nanmean(arr_THW.reshape(arr_THW.shape[0], -1), axis=1)
+
+# =========================
+# 5) ERA 8-day -> 16-day harmonization
+# =========================
+def aggregate_era8_to_era16(arr_8_THW, dates_8, var):
+    """
+    Convert ERA 8-day stacks to 16-day stacks using fixed anchors:
+      2002-01-01, 2002-01-17, ...
+    """
+    dates_8 = pd.to_datetime(dates_8)
+    start = pd.Timestamp("2002-01-01")
+    end   = pd.Timestamp("2026-01-01")
+    anchors = pd.date_range(start=start, end=end, freq="16D", inclusive="left")
+
+    out_arrs, out_dates = [], []
+
+    for a in anchors:
+        b = a + pd.Timedelta(days=16)
+        idx = np.where((dates_8 >= a) & (dates_8 < b))[0]
+
+        if len(idx) == 0:
+            continue
+
+        block = arr_8_THW[idx]
+
+        if var in MEAN_VARS:
+            agg = np.nanmean(block, axis=0).astype(np.float32)
+        elif var in SUM_VARS:
+            agg = np.nansum(block, axis=0).astype(np.float32)
+        else:
+            agg = np.nanmean(block, axis=0).astype(np.float32)
+
+        out_arrs.append(agg)
+        out_dates.append(a.normalize())
+
+    if len(out_arrs) == 0:
+        return None, None
+
+    out_arr = np.stack(out_arrs, axis=0)
+    return out_arr, out_dates
+
+# =========================
+# 6) Build pooled city-date dataframe
+# =========================
+def build_city_pooled_rows(city):
+    ERA_FILES, MERRA_FILES = discover_city_files(city)
+
+    if len(ERA_FILES) == 0 or len(MERRA_FILES) == 0:
+        return None
+
+    # target grid from ERA T2M
+    era_t2m, _, era_prof = read_merge_var(ERA_FILES, "T2M_C")
+    if era_t2m is None:
+        return None
+
+    tgt_prof = make_target_profile_from_bounds(era_prof["bounds"], deg=TARGET_DEG)
+
+    rows = []
+
+    for var in CLIMATE_VARS:
+        era_arr8, era_dates8, _ = read_merge_var(ERA_FILES, var, tgt_prof=tgt_prof, resampling=Resampling.average)
+        mer_arr16, mer_dates16, _ = read_merge_var(MERRA_FILES, var, tgt_prof=tgt_prof, resampling=Resampling.average)
+
+        if era_arr8 is None or mer_arr16 is None:
+            continue
+
+        era_arr16, era_dates16 = aggregate_era8_to_era16(era_arr8, era_dates8, var)
+        if era_arr16 is None:
+            continue
+
+        era_ts = spatial_mean_ts(era_arr16)
+        mer_ts = spatial_mean_ts(mer_arr16)
+
+        s1 = pd.Series(era_ts, index=pd.to_datetime(era_dates16)).groupby(level=0).mean()
+        s2 = pd.Series(mer_ts, index=pd.to_datetime(mer_dates16)).groupby(level=0).mean()
+
+        df_cmp = pd.concat([s1.rename("ERA5"), s2.rename("MERRA")], axis=1).dropna()
+        if len(df_cmp) == 0:
+            continue
+
+        df_cmp = df_cmp.reset_index().rename(columns={"index": "date"})
+        df_cmp["city"] = city
+        df_cmp["var"] = var
+        rows.append(df_cmp)
+
+    if len(rows) == 0:
+        return None
+
+    return pd.concat(rows, ignore_index=True)
+
+# =========================
+# 7) Select cities and build pooled data
+# =========================
+all_common_cities = pick_existing_city_list()
+
+if CITY_LIST is None:
+    cities = all_common_cities[:int(N_CITIES)]
+else:
+    cities = [c for c in CITY_LIST if c in all_common_cities][:int(N_CITIES)]
+
+print(f"Common cities found in both ROOT_DATA and ROOT_MERRA: {len(all_common_cities)}")
+print(f"Will validate {len(cities)} cities")
+print("Example cities:", cities[:10])
+
+pooled_parts = []
+used_cities = []
+
+for city in cities:
+    df_city = build_city_pooled_rows(city)
+    if df_city is not None and len(df_city) > 0:
+        pooled_parts.append(df_city)
+        used_cities.append(city)
+
+if len(pooled_parts) == 0:
+    raise ValueError("No pooled rows were produced.")
+
+pooled_df = pd.concat(pooled_parts, ignore_index=True)
+
+print("\n=== POOLED DATA (head) ===")
+display(pooled_df.head())
+
+print("\nPooled shape:", pooled_df.shape)
+print("Used cities:", len(used_cities), used_cities)
+print("Variables:", pooled_df["var"].unique().tolist())
+
+# =========================
+# 8) Global pooled summary
+# =========================
+summary_rows = []
+
+for var in CLIMATE_VARS:
+    sub = pooled_df[pooled_df["var"] == var].copy()
+    if len(sub) == 0:
+        continue
+
+    x = sub["ERA5"].to_numpy(dtype=float)
+    y = sub["MERRA"].to_numpy(dtype=float)
+
+    mask = np.isfinite(x) & np.isfinite(y)
+    x = x[mask]
+    y = y[mask]
+
+    diff = y - x
+    corr = np.corrcoef(x, y)[0, 1] if len(x) > 1 else np.nan
+    bias = float(np.nanmean(diff))
+    mae  = float(np.nanmean(np.abs(diff)))
+    rmse = float(np.sqrt(np.nanmean(diff**2)))
+
+    summary_rows.append({
+        "var": var,
+        "n_points": int(len(x)),
+        "n_cities": int(sub["city"].nunique()),
+        "era_mean": float(np.nanmean(x)),
+        "merra_mean": float(np.nanmean(y)),
+        "bias": bias,
+        "mae": mae,
+        "rmse": rmse,
+        "corr": float(corr)
+    })
+
+global_summary = pd.DataFrame(summary_rows).sort_values("var").reset_index(drop=True)
+
+print("\n=== GLOBAL POOLED SUMMARY ===")
+display(global_summary)
+
+# =========================
+# 9) Pooled scatter plots
+# =========================
+fig, axes = plt.subplots(2, 3, figsize=(15, 9), dpi=180)
+axes = axes.flatten()
+
+plot_order = CLIMATE_VARS
+
+for i, var in enumerate(plot_order):
+    ax = axes[i]
+    sub = pooled_df[pooled_df["var"] == var].copy()
+
+    if len(sub) == 0:
+        ax.set_axis_off()
+        continue
+
+    x = sub["ERA5"].to_numpy(dtype=float)
+    y = sub["MERRA"].to_numpy(dtype=float)
+
+    mask = np.isfinite(x) & np.isfinite(y)
+    x = x[mask]
+    y = y[mask]
+
+    # random sample for plotting only
+    if len(x) > MAX_POINTS_PER_VAR:
+        idx = rng.choice(len(x), size=MAX_POINTS_PER_VAR, replace=False)
+        x_plot = x[idx]
+        y_plot = y[idx]
+    else:
+        x_plot = x
+        y_plot = y
+
+    # metrics from full pooled data
+    row = global_summary.loc[global_summary["var"] == var].iloc[0]
+
+    # scatter
+    ax.scatter(
+        x_plot, y_plot,
+        s=6,
+        alpha=0.18,
+        edgecolors="none"
+    )
+
+    # 1:1 line
+    lo = min(np.nanmin(x_plot), np.nanmin(y_plot))
+    hi = max(np.nanmax(x_plot), np.nanmax(y_plot))
+    ax.plot([lo, hi], [lo, hi], "--", linewidth=1.2, label="1:1")
+
+    # regression line
+    slope, intercept = np.polyfit(x_plot, y_plot, 1)
+    xx = np.linspace(lo, hi, 200)
+    yy = slope * xx + intercept
+    ax.plot(xx, yy, linewidth=1.5, label="Fit")
+
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
+    ax.set_xlabel("ERA5")
+    ax.set_ylabel("MERRA-2")
+    ax.set_title(AXIS_LABELS.get(var, var))
+
+    txt = (
+        f"N = {int(row['n_points'])}\n"
+        f"r = {row['corr']:.3f}\n"
+        f"Bias = {row['bias']:.3f}\n"
+        f"RMSE = {row['rmse']:.3f}"
+    )
+    ax.text(
+        0.04, 0.96, txt,
+        transform=ax.transAxes,
+        va="top", ha="left",
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.85, edgecolor="0.7")
+    )
+
+    if i == 0:
+        ax.legend(loc="lower right", frameon=True)
+
+# remove last empty panel
+if len(axes) > len(plot_order):
+    for j in range(len(plot_order), len(axes)):
+        fig.delaxes(axes[j])
+
+plt.tight_layout()
+plt.show()
