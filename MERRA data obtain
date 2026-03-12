@@ -1,0 +1,232 @@
+/**** City | MERRA-2 | 8 variables | 8-day | 0.1° | segmented export ****/
+
+/* =========================
+ * 0) Parameters
+ * ========================= */
+var CITY_NAME      = 'Guangzhou';
+var CITY_LON       = 113.2644;
+var CITY_LAT       = 23.1291;
+var CITY_BUFFER_KM = 80;
+
+var EXPORT_CRS     = 'EPSG:4326';
+var DEG_PER_PIXEL  = 0.1;     // 0.1°
+var DO_EXPORT      = true;
+
+var EXPORT_FOLDER  = 'MERRA2_8day_0p1deg_CITY_' + CITY_NAME;
+
+/* =========================
+ * 1) ROI
+ * ========================= */
+var cityPoint  = ee.Geometry.Point([CITY_LON, CITY_LAT]);
+var cityBuffer = cityPoint.buffer(CITY_BUFFER_KM * 1000);
+
+var b = cityBuffer.bounds();
+var coords = ee.List(b.coordinates().get(0));
+var xs = coords.map(function(pt){ return ee.List(pt).getNumber(0); });
+var ys = coords.map(function(pt){ return ee.List(pt).getNumber(1); });
+
+var lonMin = ee.Number(xs.reduce(ee.Reducer.min()));
+var lonMax = ee.Number(xs.reduce(ee.Reducer.max()));
+var latMin = ee.Number(ys.reduce(ee.Reducer.min()));
+var latMax = ee.Number(ys.reduce(ee.Reducer.max()));
+
+var roiSafe = ee.Geometry.Rectangle([lonMin, latMin, lonMax, latMax], EXPORT_CRS, false);
+
+var WIDTH_PX  = lonMax.subtract(lonMin).divide(DEG_PER_PIXEL).round();
+var HEIGHT_PX = latMax.subtract(latMin).divide(DEG_PER_PIXEL).round();
+var EXPORT_DIMS = ee.String(WIDTH_PX.format()).cat('x').cat(HEIGHT_PX.format());
+
+Map.centerObject(cityPoint, 8);
+Map.addLayer(roiSafe, {color: 'orange'}, CITY_NAME + ' ROI', false);
+print('Export dims:', EXPORT_DIMS);
+
+/* =========================
+ * 2) MERRA-2 collections
+ * ========================= */
+var MERRA_SLV = ee.ImageCollection('NASA/GSFC/MERRA/slv/2');
+var MERRA_RAD = ee.ImageCollection('NASA/GSFC/MERRA/rad/2');
+var MERRA_LND = ee.ImageCollection('NASA/GSFC/MERRA/lnd/2');
+
+/* Debug band names if needed */
+// print('SLV bands:', ee.Image(MERRA_SLV.first()).bandNames());
+// print('RAD bands:', ee.Image(MERRA_RAD.first()).bandNames());
+// print('LND bands:', ee.Image(MERRA_LND.first()).bandNames());
+
+/* =========================
+ * 3) Time helpers
+ * ========================= */
+function list8dayDatesBetween(startDate, endDate){
+  startDate = ee.Date(startDate);
+  endDate   = ee.Date(endDate);
+  var nDays = endDate.difference(startDate, 'day');
+  var steps = ee.List.sequence(0, nDays.subtract(1), 8);
+  return steps.map(function(d){
+    return startDate.advance(ee.Number(d), 'day');
+  });
+}
+
+function tagYYYYMMDD(date){
+  return ee.Date(date).format('YYYYMMdd');
+}
+
+/* =========================
+ * 4) VPD from T and Td
+ *    output: kPa
+ * ========================= */
+function vpdFromT_Td_C(tC, tdC){
+  return tC.expression(
+    '0.6108 * exp(17.27 * T / (T + 237.3)) - 0.6108 * exp(17.27 * Td / (Td + 237.3))',
+    {T: tC, Td: tdC}
+  ).rename('VPD_kPa');
+}
+
+/* =========================
+ * 5) Empty placeholder
+ * ========================= */
+function emptyBandsForTag(tag){
+  var e = ee.Image(0).updateMask(ee.Image(0));
+  return e.rename(ee.String('T2M_C_').cat(tag))
+    .addBands(e.rename(ee.String('TD_C_').cat(tag)))
+    .addBands(e.rename(ee.String('VPD_kPa_').cat(tag)))
+    .addBands(e.rename(ee.String('WIND10M_MS_').cat(tag)))
+    .addBands(e.rename(ee.String('SSRD_MJm2_').cat(tag)))
+    .addBands(e.rename(ee.String('TP_mm_').cat(tag)))
+    .addBands(e.rename(ee.String('SWVL1_m3m3_').cat(tag)))
+    .addBands(e.rename(ee.String('STL1_C_').cat(tag)));
+}
+
+/* =========================
+ * 6) Aggregate one 8-day window
+ * ========================= */
+function aggregate8dayWindow(dStart, slvSeg, radSeg, lndSeg){
+  dStart = ee.Date(dStart);
+  var dEnd = dStart.advance(8, 'day');
+  var tag  = tagYYYYMMDD(dStart);
+
+  var slv = slvSeg.filterDate(dStart, dEnd);
+  var rad = radSeg.filterDate(dStart, dEnd);
+  var lnd = lndSeg.filterDate(dStart, dEnd);
+
+  var hasData = slv.size().gt(0);
+
+  var out = ee.Image(ee.Algorithms.If(hasData, (function(){
+
+    // 1) T2M / TD / WIND
+    var T2M_C = slv.select('T2M').mean().subtract(273.15).rename('T2M_C');
+    var TD_C  = slv.select('T2MDEW').mean().subtract(273.15).rename('TD_C');
+
+    var U = slv.select('U10M').mean();
+    var V = slv.select('V10M').mean();
+    var WIND = U.hypot(V).rename('WIND10M_MS');
+
+    // 2) VPD
+    var VPD = vpdFromT_Td_C(T2M_C, TD_C);
+
+    // 3) SSRD
+    // SWGDN: hourly mean shortwave flux (W m^-2)
+    // 8-day accumulated energy:
+    // sum(hourly W m^-2) * 3600 sec / 1e6 = MJ m^-2
+    var SSRD_MJ = rad.select('SWGDN')
+      .sum()
+      .multiply(3600)
+      .divide(1e6)
+      .rename('SSRD_MJm2');
+
+    // 4) TP
+    // PRECTOTLAND is precipitation flux (kg m^-2 s^-1), 1 kg m^-2 = 1 mm
+    // 8-day accumulated precipitation:
+    // sum(hourly flux) * 3600 = mm
+    var TP_mm = lnd.select('PRECTOTLAND')
+      .sum()
+      .multiply(3600)
+      .rename('TP_mm');
+
+    // 5) SWVL1
+    // SFMC: surface soil wetness / moisture proxy
+    var SWVL1 = lnd.select('SFMC')
+      .mean()
+      .rename('SWVL1_m3m3');
+
+    // 6) STL1
+    // TSOIL1: soil temperature layer 1, convert K -> C
+    var STL1C = lnd.select('TSOIL1')
+      .mean()
+      .subtract(273.15)
+      .rename('STL1_C');
+
+    return T2M_C.rename(ee.String('T2M_C_').cat(tag))
+      .addBands(TD_C.rename(ee.String('TD_C_').cat(tag)))
+      .addBands(VPD.rename(ee.String('VPD_kPa_').cat(tag)))
+      .addBands(WIND.rename(ee.String('WIND10M_MS_').cat(tag)))
+      .addBands(SSRD_MJ.rename(ee.String('SSRD_MJm2_').cat(tag)))
+      .addBands(TP_mm.rename(ee.String('TP_mm_').cat(tag)))
+      .addBands(SWVL1.rename(ee.String('SWVL1_m3m3_').cat(tag)))
+      .addBands(STL1C.rename(ee.String('STL1_C_').cat(tag)));
+
+  })(), emptyBandsForTag(tag)));
+
+  return out;
+}
+
+/* =========================
+ * 7) Build one segment stack
+ * ========================= */
+function buildMERRA8dayStackSegment(startDate, endDate){
+  var slvSeg = MERRA_SLV.filterDate(startDate, endDate).filterBounds(roiSafe);
+  var radSeg = MERRA_RAD.filterDate(startDate, endDate).filterBounds(roiSafe);
+  var lndSeg = MERRA_LND.filterDate(startDate, endDate).filterBounds(roiSafe);
+
+  var dates8 = ee.List(list8dayDatesBetween(startDate, endDate));
+
+  var ic = ee.ImageCollection.fromImages(
+    dates8.map(function(d){
+      return aggregate8dayWindow(d, slvSeg, radSeg, lndSeg);
+    })
+  );
+
+  var img = ic.toBands();
+
+  // remove numeric prefixes from toBands()
+  var old = img.bandNames();
+  var neu = old.map(function(n){
+    return ee.String(n).replace('^(\\d+_)+', '');
+  });
+  img = img.rename(neu);
+
+  img = img.setDefaultProjection(EXPORT_CRS, null, DEG_PER_PIXEL);
+  img = img.clip(roiSafe);
+
+  return img;
+}
+
+/* =========================
+ * 8) Export one segment
+ * ========================= */
+function exportSegment(label, startDate, endDate){
+  var img = buildMERRA8dayStackSegment(startDate, endDate);
+
+  print('Segment', label, 'bands =', img.bandNames().size());
+  print('Segment', label, 'first 12 bands:', img.bandNames().slice(0, 12));
+
+  if (DO_EXPORT){
+    Export.image.toDrive({
+      image         : img.toFloat(),
+      description   : CITY_NAME + '_MERRA2main_8day_0p1deg_' + label,
+      folder        : EXPORT_FOLDER,
+      fileNamePrefix: CITY_NAME + '_MERRA2main_8day_0p1deg_' + label,
+      region        : roiSafe,
+      crs           : EXPORT_CRS,
+      dimensions    : EXPORT_DIMS.getInfo(),
+      maxPixels     : 1e13
+    });
+  }
+}
+
+/* =========================
+ * 9) Export 3 segments
+ * ========================= */
+exportSegment('2002_2010', ee.Date('2002-01-01'), ee.Date('2011-01-01'));
+exportSegment('2011_2018', ee.Date('2011-01-01'), ee.Date('2019-01-01'));
+exportSegment('2019_2025', ee.Date('2019-01-01'), ee.Date('2026-01-01'));
+
+print('✅ MERRA-2 8-day segmented export tasks created.');
